@@ -1,0 +1,252 @@
+
+import os, requests, pandas as pd, streamlit as st
+import numpy as np
+import matplotlib.pyplot as plt
+
+st.set_page_config(page_title="SunSim Suite — Pro (IEC)", page_icon="🌞", layout="wide")
+
+API_URL = os.getenv("API_URL", "http://api:8000")
+PUBLIC_API_BASE = os.getenv("PUBLIC_API_BASE", "")
+
+def api(path, method="GET", json=None):
+    url = f"{API_URL}{path}"
+    r = requests.request(method, url, json=json, timeout=15)
+    if not (200 <= r.status_code < 300):
+        try:
+            err = r.json()
+        except Exception:
+            err = {"error": r.text}
+        st.error(f"API error {r.status_code}: {err}")
+        st.stop()
+    return r.json()
+
+st.title("🌞 SunSim Suite — Pro (IEC)")
+st.caption("Calibration • History • IEC Spectral/Uniformity/Stability")
+
+tab_sim, tab_hist, tab_health, tab_iec = st.tabs(["Simulator", "History", "Health", "IEC Test"])
+
+with tab_sim:
+    st.subheader("LED currents (mA)")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        r = st.slider("Red", 0, 1000, 170, 10)
+    with col2:
+        g = st.slider("Green", 0, 1000, 400, 10)
+    with col3:
+        b = st.slider("Blue", 0, 1000, 400, 10)
+
+    if st.button("Simulate", use_container_width=True):
+        data = api("/simulate", method="POST", json={"red": r, "green": g, "blue": b})
+        st.success(f"Irradiance: {data['irradiance_wm2']:.1f} W/m²  · run_id={data['run_id']}")
+
+    with st.expander("Calibration"):
+        cal = api("/calibrate")
+        st.write("Active coefficients (W/m² per mA):", cal)
+        rc = st.number_input("red_coeff", value=float(cal["red_coeff"]), step=0.01, format="%.4f")
+        gc = st.number_input("green_coeff", value=float(cal["green_coeff"]), step=0.01, format="%.4f")
+        bc = st.number_input("blue_coeff", value=float(cal["blue_coeff"]), step=0.01, format="%.4f")
+        bias = st.number_input("bias", value=float(cal["bias"]), step=0.1, format="%.2f")
+        note = st.text_input("note", value="manual update")
+        if st.button("Update calibration"):
+            api("/calibrate", method="POST", json={"red_coeff": rc, "green_coeff": gc, "blue_coeff": bc, "bias": bias, "note": note})
+            st.success("Calibration updated.")
+
+with tab_hist:
+    st.subheader("Recent runs")
+    items = api("/runs?limit=200")["items"]
+    if items:
+        df = pd.DataFrame(items)
+        st.dataframe(df, use_container_width=True)
+        st.caption("Persisted in Postgres; exported via /runs.")
+    else:
+        st.info("No runs yet. Simulate above.")
+
+with tab_health:
+    st.subheader("Health")
+    h = api("/health")
+    st.write(h)
+    if PUBLIC_API_BASE:
+        st.caption(f"External API base (LAN/Tailnet): {PUBLIC_API_BASE}")
+
+with tab_iec:
+    st.header("IEC Test — Spectral, Uniformity, Stability")
+    st.write("""
+This module helps you visualize **IEC 60904-9** metrics:
+- **Spectral Match** vs AM1.5G (6 bins: 300–1200 nm) with ratio bands for A+/A/B/C  
+- **Spatial Non-uniformity** heatmap and **S** (%)  
+- **Temporal Instability** time series with **STI/LTI** (%)
+""")
+
+    # --- Spectral ---
+    st.subheader("1) Spectral Match (CSV: wavelength_nm,E)")
+    spec_file = st.file_uploader("Upload spectrum CSV", type=["csv"], key="spec_csv")
+    if spec_file is not None:
+        df = pd.read_csv(spec_file)
+        if set(df.columns) >= {"wavelength_nm","E"}:
+            wl = df["wavelength_nm"].to_numpy()
+            E = df["E"].to_numpy()
+            res = api("/iec/spectral", method="POST", json={"wavelength_nm": wl.tolist(), "E": E.tolist()})
+            if res.get("ok"):
+                fr = np.array(res["bin_fractions"])
+                am = np.array(res["am15g_bin_fractions"])
+                ratio = np.array(res["ratio"])
+                edges = np.array(res["bin_edges_nm"])
+
+                st.success(f"Spectral Class (bins): {res['class']}")
+
+                # Spectrum plot with AM1.5G overlay (bin-step)
+                show_am = st.checkbox("Show AM1.5G overlay", value=True)
+
+                fig1 = plt.figure()
+                # 1) Measured (normalized)
+                E_norm = E / np.maximum(np.max(E), 1e-9)
+                plt.plot(wl, E_norm, label="Measured (normalized)")
+
+                if show_am:
+                    # 2) Build a step-like AM1.5G density curve from bin fractions
+                    #    For each bin, distribute the bin fraction uniformly over its width.
+                    am_wl = []
+                    am_y  = []
+                    for i in range(len(edges) - 1):
+                        lo, hi = edges[i], edges[i+1]
+                        width = max(1e-9, hi - lo)
+                        density = am[i] / width  # proportional density over the bin
+                        # make a step: (lo, density) → (hi, density)
+                        am_wl.extend([lo, hi])
+                        am_y.extend([density, density])
+
+                    # Normalize AM1.5G curve to overlay fairly with measured (unitless comparison)
+                    am_y = np.array(am_y, dtype=float)
+                    am_y_norm = am_y / np.maximum(am_y.max(), 1e-9)
+                    plt.plot(am_wl, am_y_norm, linestyle="--", label="AM1.5G (bin-step, normalized)")
+
+                    # Draw dashed verticals at bin edges for visual anchoring
+                    for x in edges:
+                        plt.axvline(x=x, linestyle=":", linewidth=0.8)
+
+                plt.title("Measured Spectrum vs AM1.5G (normalized)")
+                plt.xlabel("Wavelength (nm)")
+                plt.ylabel("Relative")
+                plt.legend()
+                st.pyplot(fig1)
+
+                # Bin performance bars
+                fig2 = plt.figure()
+                x = np.arange(len(fr)); width = 0.35
+                plt.bar(x - width/2, am, width, label="AM1.5G")
+                plt.bar(x + width/2, fr, width, label="Measured")
+                plt.xticks(x, [f"{int(edges[i])}-{int(edges[i+1])}" for i in range(len(edges)-1)])
+                plt.ylabel("Fraction of total")
+                plt.title("Bin Fractions (AM1.5G vs Measured)")
+                plt.legend()
+                st.pyplot(fig2)
+
+                # Ratio with class bands
+                bands = {"A+": (0.875,1.125), "A":(0.75,1.25), "B":(0.60,1.40), "C":(0.40,2.00)}
+                fig3 = plt.figure()
+                x = np.arange(len(ratio))
+                plt.plot(x, ratio, marker="o")
+                for cls,(lo,hi) in bands.items():
+                    plt.hlines([lo,hi], x[0]-0.5, x[-1]+0.5, linestyles="dashed")
+                plt.xticks(x, [f"{int(edges[i])}-{int(edges[i+1])}" for i in range(len(edges)-1)])
+                plt.ylabel("Measured / AM1.5G")
+                plt.title("Bin Ratios vs Class Bands")
+                st.pyplot(fig3)
+
+                with st.expander("Interpretation"):
+                    st.markdown("""
+- Each point = your bin energy ÷ AM1.5G bin energy.  
+- To achieve a class, **all** points must sit within that band.  
+- Correct out-of-band bins with driver trims, spectral filters, or extra channels.
+""")
+            else:
+                st.error(res.get("error","Unable to compute spectral match."))
+        else:
+            st.error("CSV must have columns: wavelength_nm,E")
+
+    # --- Uniformity ---
+    st.subheader("2) Spatial Uniformity (CSV grid, no header)")
+    grid_file = st.file_uploader("Upload uniformity grid", type=["csv"], key="grid_csv")
+    if grid_file is not None:
+        gdf = pd.read_csv(grid_file, header=None)
+        grid = gdf.values.tolist()
+        res = api("/iec/uniformity", method="POST", json={"grid": grid})
+        if res.get("ok"):
+            S = res["S"]; cls = res["class"]
+            st.success(f"Non-uniformity S = {S*100:.2f}% → Class {cls}")
+            fig = plt.figure()
+            plt.imshow(gdf.values, aspect="equal")
+            plt.colorbar(label="Irradiance")
+            plt.title("Uniformity Heatmap")
+            st.pyplot(fig)
+            st.caption("S = (Imax − Imin) / (Imax + Imin). Lower is better.")
+        else:
+            st.error("Could not compute uniformity.")
+
+    # --- Stability ---
+    st.subheader("3) Temporal Instability (single-column CSV)")
+    colA,colB,colC = st.columns(3)
+    sample_hz = colA.number_input("Sample rate (Hz)", 1.0, 5000.0, 100.0, 1.0)
+    sti_s = colB.number_input("STI window (s)", 0.1, 10.0, 1.0, 0.1)
+    lti_s = colC.number_input("LTI window (s)", 5.0, 600.0, 60.0, 5.0)
+    ts_file = st.file_uploader("Upload time-series CSV", type=["csv"], key="ts_csv")
+    if ts_file is not None:
+        ts = pd.read_csv(ts_file, header=None)[0].astype(float).to_numpy()
+        res = api("/iec/stability", method="POST", json={
+            "irradiance": ts.tolist(), "sample_hz": sample_hz, "sti_window_s": sti_s, "lti_window_s": lti_s
+        })
+        if res.get("ok", True):
+            st.success(f"STI ≈ {res['sti_pct']:.2f}% (class {res['class_sti']}), LTI ≈ {res['lti_pct']:.2f}% (class {res['class_lti']})")
+            fig = plt.figure()
+            plt.plot(ts)
+            plt.title("Irradiance vs Time"); plt.xlabel("Sample"); plt.ylabel("Irradiance")
+            st.pyplot(fig)
+        else:
+            st.error("Could not compute stability metrics.")
+            
+            # --- Reference Spectrum Comparison ---
+st.subheader("4) Full Solar Reference Comparison")
+
+show_ref = st.checkbox("Show standard AM0 / AM1.5G / AM1.5D references", value=True)
+ref_range = st.selectbox("Plot range (nm)", ["300–1200", "300–4000"])
+norm = st.checkbox("Normalize spectra", value=True)
+
+spec_file2 = st.file_uploader("Upload your measured spectrum CSV (wavelength_nm,E)", type=["csv"], key="spec_full_csv")
+
+if show_ref:
+    # Simplified embedded subset of ASTM G173 reference points (short list for demo)
+    # You can replace with full CSV later
+    ref_data = {
+        "AM0":  {"λ":[280,300,400,500,600,700,800,900,1000,1200], "E":[1.9,2.0,1.9,1.8,1.6,1.4,1.2,1.0,0.8,0.6]},
+        "AM1.5G":{"λ":[280,300,400,500,600,700,800,900,1000,1200], "E":[1.5,1.6,1.5,1.4,1.2,1.0,0.8,0.6,0.4,0.3]},
+        "AM1.5D":{"λ":[280,300,400,500,600,700,800,900,1000,1200], "E":[1.3,1.4,1.3,1.2,1.0,0.9,0.7,0.5,0.3,0.2]},
+    }
+
+    fig = plt.figure()
+    for label, data in ref_data.items():
+        x = np.array(data["λ"]); y = np.array(data["E"])
+        if norm:
+            y = y / np.max(y)
+        plt.plot(x, y, label=label)
+
+    if spec_file2 is not None:
+        dfm = pd.read_csv(spec_file2)
+        if set(dfm.columns) >= {"wavelength_nm","E"}:
+            x = dfm["wavelength_nm"].to_numpy()
+            y = dfm["E"].to_numpy()
+            if norm:
+                y = y / np.max(y)
+            plt.plot(x, y, label="Measured", color="red")
+
+    if ref_range == "300–1200":
+        plt.xlim(300, 1200)
+    else:
+        plt.xlim(300, 4000)
+
+    plt.xlabel("Wavelength (nm)")
+    plt.ylabel("Spectral Irradiance (W m⁻² nm⁻¹)" if not norm else "Normalized Irradiance")
+    plt.title("Solar Reference Spectra vs Measured")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    st.pyplot(fig)
+
