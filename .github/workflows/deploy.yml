@@ -54,7 +54,7 @@ jobs:
           build_push sunsim-ui  ./sunsim-ui
           build_push sunsim-api ./sunsim-api
           build_push pump-sim   ./pump-sim
-          build_push pv-defects ./pv-defects
+          build_push pv-defects ./pv-defects   # skipped until added
 
       - name: Redeploy on VM (docker compose pull/up)
         run: |
