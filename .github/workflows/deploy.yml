@@ -1,0 +1,69 @@
+name: Build & Deploy to GCP
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  REGION: ${{ secrets.GCP_REGION }}                            # e.g. asia-south1
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}                    # altius-surya-tech
+  REGISTRY: ${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/app-repo
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build & Push (skip any app without a Dockerfile)
+        run: |
+          set -e
+          SHA=$(git rev-parse --short HEAD)
+          build_push () {
+            NAME="$1"
+            CONTEXT="$2"
+            echo "==> Checking $NAME in $CONTEXT"
+            if [ -d "$CONTEXT" ] && [ -f "$CONTEXT/Dockerfile" ]; then
+              echo "Building $NAME ..."
+              docker build -t "$REGISTRY/$NAME:latest" -t "$REGISTRY/$NAME:$SHA" "$CONTEXT"
+              docker push "$REGISTRY/$NAME:latest"
+              docker push "$REGISTRY/$NAME:$SHA"
+            else
+              echo "Skipping $NAME (missing dir or Dockerfile)"
+            fi
+          }
+
+          build_push sunsim-ui  ./sunsim-ui
+          build_push sunsim-api ./sunsim-api
+          build_push pump-sim   ./pump-sim
+          build_push pv-defects ./pv-defects
+
+      - name: Redeploy on VM (docker compose pull/up)
+        run: |
+          gcloud compute ssh ubuntu@${{ secrets.GCP_VM_NAME }} \
+            --zone ${{ secrets.GCP_VM_ZONE }} \
+            --command 'bash -lc "
+              set -e
+              cd /opt/altius-stack
+              sudo docker compose pull
+              sudo docker compose up -d
+              sudo docker image prune -f
+            "'
