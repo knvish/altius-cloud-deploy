@@ -1,0 +1,40 @@
+name: GCP OIDC + VM smoke
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: SSH to VM and show status
+        run: |
+          gcloud compute ssh ubuntu@${{ secrets.GCP_VM_NAME }} \
+            --zone ${{ secrets.GCP_VM_ZONE }} \
+            --command 'bash -lc "
+              set -e
+              echo === Hostname ===
+              hostnamectl
+              echo === Docker ===
+              docker ps --format \"table {{.Names}}\t{{.Status}}\t{{.Ports}}\"
+              echo === Caddy ===
+              sudo systemctl status --no-pager caddy | head -n 20 || true
+              echo === Caddy index ===
+              curl -s http://127.0.0.1/ | head -n 2 || true
+            "'
